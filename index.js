@@ -25,10 +25,8 @@ let isConnected = false;
 let phoneNumber = null;
 let isConnecting = false;
 
-// Logger con livello ridotto
 const logger = pino({ level: 'warn' });
 
-// Middleware autenticazione
 function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
   
@@ -45,7 +43,6 @@ function authenticate(req, res, next) {
   next();
 }
 
-// Funzione per pulire auth
 function clearAuthFiles() {
   try {
     if (fs.existsSync(AUTH_DIR)) {
@@ -61,7 +58,6 @@ function clearAuthFiles() {
   }
 }
 
-// Funzione connessione MIGLIORATA
 async function connectToWhatsApp() {
   if (isConnecting) {
     console.log('[WA] ⚠️ Connessione già in corso, skip');
@@ -110,34 +106,52 @@ async function connectToWhatsApp() {
       }
       
       if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        console.log('[WA] ⛔ Connessione chiusa. Codice:', lastDisconnect?.error?.output?.statusCode);
-        console.log('[WA] 🔄 Riconnessione:', shouldReconnect);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        
+        console.log('[WA] ⛔ Connessione chiusa. Codice:', statusCode);
+        console.log('[WA] 📋 Tipo errore:', lastDisconnect?.error?.message);
         
         isConnected = false;
         phoneNumber = null;
         qrCodeData = null;
         isConnecting = false;
         
-        if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
-          console.log('[WA] 🧹 Logout esplicito, pulizia auth files');
+        // CASO 1: Logout esplicito dal server
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('[WA] 🧹 Logout esplicito dal server');
           clearAuthFiles();
           sock = null;
+          setTimeout(() => {
+            console.log('[WA] 🔄 Rigenerazione QR dopo logout...');
+            connectToWhatsApp();
+          }, 3000);
         } 
-        else if (lastDisconnect?.error?.output?.statusCode === 401) {
-          console.log('[WA] 🧹 Errore 401, pulizia auth e retry');
+        // CASO 2: Disconnesso dal telefono (401, 403, 440)
+        else if (statusCode === 401 || statusCode === 403 || statusCode === 440) {
+          console.log('[WA] 📱 Disconnesso dal telefono, rigenerazione QR...');
           clearAuthFiles();
           sock = null;
           setTimeout(() => connectToWhatsApp(), 3000);
         }
-        else if (lastDisconnect?.error?.output?.statusCode === 428) {
-          console.log('[WA] 🧹 QR scaduto, pulizia auth e retry');
+        // CASO 3: QR scaduto o sessione invalida (428, 500, 515)
+        else if (statusCode === 428 || statusCode === 500 || statusCode === 515) {
+          console.log('[WA] 🧹 Sessione invalida (code: ' + statusCode + '), pulizia e retry');
           clearAuthFiles();
           sock = null;
           setTimeout(() => connectToWhatsApp(), 3000);
         }
-        else if (shouldReconnect) {
+        // CASO 4: Errore connessione generica (riprova senza pulire)
+        else if (shouldReconnect && statusCode) {
+          console.log('[WA] 🔄 Errore temporaneo (code: ' + statusCode + '), riconnessione tra 5 secondi...');
           setTimeout(() => connectToWhatsApp(), 5000);
+        }
+        // CASO 5: Nessun codice specifico (pulisci preventivamente)
+        else {
+          console.log('[WA] ⚠️ Connessione chiusa senza codice valido, pulizia preventiva');
+          clearAuthFiles();
+          sock = null;
+          setTimeout(() => connectToWhatsApp(), 3000);
         }
       } 
       else if (connection === 'open') {
@@ -179,7 +193,6 @@ async function connectToWhatsApp() {
   }
 }
 
-// Avvia connessione all'avvio
 connectToWhatsApp();
 
 // ========================================
@@ -190,7 +203,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiApp WhatsApp Server',
-    version: '1.2.0',
+    version: '1.3.0',
     connected: isConnected,
     isConnecting: isConnecting
   });
