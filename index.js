@@ -13,7 +13,7 @@ import pino from 'pino';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || 'miapp-secret-token-2024-change-this';
+const AUTH_TOKEN = process.env.AUTH_TOKEN || 'miapp-secret-token-2024';
 const AUTH_DIR = './auth_info_baileys';
 
 app.use(cors());
@@ -21,7 +21,7 @@ app.use(express.json());
 
 let sock = null;
 let qrCodeData = null;
-let isConnected = false;
+let connectionStatus = 'disconnected'; // 'disconnected' | 'qr_ready' | 'connecting' | 'connected'
 let phoneNumber = null;
 let isConnecting = false;
 
@@ -66,6 +66,7 @@ async function connectToWhatsApp() {
   
   try {
     isConnecting = true;
+    connectionStatus = 'connecting';
     console.log('[WA] 🔄 Avvio connessione...');
     
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -97,9 +98,11 @@ async function connectToWhatsApp() {
       
       if (qr) {
         console.log('[WA] 📱 QR Code generato');
+        connectionStatus = 'qr_ready';
         try {
           qrCodeData = await QRCode.toDataURL(qr);
           qrcode.generate(qr, { small: true });
+          console.log('[WA] ✅ QR Code convertito in Data URL');
         } catch (err) {
           console.error('[WA] ❌ Errore generazione QR:', err);
         }
@@ -112,7 +115,7 @@ async function connectToWhatsApp() {
         console.log('[WA] ⛔ Connessione chiusa. Codice:', statusCode);
         console.log('[WA] 📋 Tipo errore:', lastDisconnect?.error?.message);
         
-        isConnected = false;
+        connectionStatus = 'disconnected';
         phoneNumber = null;
         qrCodeData = null;
         isConnecting = false;
@@ -156,7 +159,7 @@ async function connectToWhatsApp() {
       } 
       else if (connection === 'open') {
         console.log('[WA] ✅ Connesso a WhatsApp');
-        isConnected = true;
+        connectionStatus = 'connected';
         qrCodeData = null;
         isConnecting = false;
         
@@ -170,6 +173,7 @@ async function connectToWhatsApp() {
       }
       else if (connection === 'connecting') {
         console.log('[WA] 🔄 Connessione in corso...');
+        connectionStatus = 'connecting';
       }
     });
     
@@ -183,6 +187,7 @@ async function connectToWhatsApp() {
   } catch (error) {
     console.error('[WA] ❌ Errore connessione:', error);
     isConnecting = false;
+    connectionStatus = 'disconnected';
     
     if (error.message?.includes('invalid') || error.message?.includes('unauthorized')) {
       console.log('[WA] 🧹 Errore critico, pulizia auth');
@@ -203,20 +208,27 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiApp WhatsApp Server',
-    version: '1.3.0',
-    connected: isConnected,
+    version: '1.4.0',
+    connectionStatus: connectionStatus,
+    connected: connectionStatus === 'connected',
     isConnecting: isConnecting
   });
 });
 
-app.get('/status', (req, res) => {
-  console.log('[STATUS] 📊 Richiesta stato');
+// ✅ ROUTE /status CORRETTA
+app.get('/status', authenticate, (req, res) => {
+  console.log('[STATUS] 📊 Richiesta stato ricevuta');
+  console.log('[STATUS] connectionStatus:', connectionStatus);
+  console.log('[STATUS] qrCodeData presente?:', !!qrCodeData);
+  console.log('[STATUS] phoneNumber:', phoneNumber);
   
   res.json({
-    connected: isConnected,
+    success: true,
+    status: connectionStatus || 'disconnected',
+    connected: connectionStatus === 'connected',
     qrCode: qrCodeData,
     phoneNumber: phoneNumber,
-    isConnecting: isConnecting
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -230,9 +242,10 @@ app.post('/send', authenticate, async (req, res) => {
       });
     }
     
-    if (!sock || !isConnected) {
+    if (!sock || connectionStatus !== 'connected') {
       return res.status(503).json({ 
-        error: 'WhatsApp non connesso' 
+        error: 'WhatsApp non connesso',
+        currentStatus: connectionStatus
       });
     }
     
@@ -247,7 +260,8 @@ app.post('/send', authenticate, async (req, res) => {
     
     res.json({ 
       success: true,
-      messageId: Date.now().toString()
+      messageId: Date.now().toString(),
+      timestamp: new Date().toISOString()
     });
     
   } catch (error) {
@@ -273,7 +287,7 @@ app.post('/disconnect', authenticate, async (req, res) => {
       sock = null;
     }
     
-    isConnected = false;
+    connectionStatus = 'disconnected';
     phoneNumber = null;
     qrCodeData = null;
     isConnecting = false;
@@ -315,7 +329,7 @@ app.post('/reconnect', authenticate, async (req, res) => {
       sock = null;
     }
     
-    isConnected = false;
+    connectionStatus = 'disconnected';
     phoneNumber = null;
     qrCodeData = null;
     isConnecting = false;
@@ -354,7 +368,7 @@ app.post('/force-clean', authenticate, async (req, res) => {
       sock = null;
     }
     
-    isConnected = false;
+    connectionStatus = 'disconnected';
     phoneNumber = null;
     qrCodeData = null;
     isConnecting = false;
@@ -392,5 +406,6 @@ app.listen(PORT, () => {
   console.log(`🚀 [SERVER] In ascolto su porta ${PORT}`);
   console.log(`🌍 [SERVER] Ambiente: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔐 [SERVER] Auth Token: ${AUTH_TOKEN.substring(0, 10)}...`);
+  console.log(`📊 [SERVER] Status iniziale: ${connectionStatus}`);
   console.log('='.repeat(60));
 });
