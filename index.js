@@ -13,7 +13,7 @@ import pino from 'pino';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || 'miapp-secret-token-2024';
+const AUTH_TOKEN = process.env.AUTH_TOKEN || 'miserve_whatsapp_2024_SUPERSECRET123';
 const AUTH_DIR = './auth_info_baileys';
 
 app.use(cors());
@@ -21,7 +21,7 @@ app.use(express.json());
 
 let sock = null;
 let qrCodeData = null;
-let connectionStatus = 'disconnected'; // 'disconnected' | 'qr_ready' | 'connecting' | 'connected'
+let connectionStatus = 'disconnected';
 let phoneNumber = null;
 let isConnecting = false;
 
@@ -74,6 +74,7 @@ async function connectToWhatsApp() {
     
     console.log(`[WA] 📱 Baileys v${version.join('.')}, latest: ${isLatest}`);
     
+    // 🔥 CONFIGURAZIONE AGGIORNATA
     sock = makeWASocket({
       version,
       auth: {
@@ -82,13 +83,14 @@ async function connectToWhatsApp() {
       },
       printQRInTerminal: true,
       logger,
-      browser: ['MiServe', 'Chrome', '110.0.0'],
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 30000,
+      browser: ['MiServe CRM', 'Chrome', '120.0.0'], // 🔥 User-agent aggiornato
+      connectTimeoutMs: 90000, // 🔥 Timeout aumentato a 90 secondi
+      defaultQueryTimeoutMs: 90000,
+      keepAliveIntervalMs: 25000, // 🔥 Keep-alive ogni 25 secondi
       markOnlineOnConnect: true,
       syncFullHistory: false,
-      generateHighQualityLinkPreview: false
+      generateHighQualityLinkPreview: false,
+      getMessage: async () => undefined // 🔥 Handler messaggi mancanti
     });
     
     sock.ev.on('creds.update', saveCreds);
@@ -120,7 +122,6 @@ async function connectToWhatsApp() {
         qrCodeData = null;
         isConnecting = false;
         
-        // CASO 1: Logout esplicito dal server
         if (statusCode === DisconnectReason.loggedOut) {
           console.log('[WA] 🧹 Logout esplicito dal server');
           clearAuthFiles();
@@ -130,26 +131,22 @@ async function connectToWhatsApp() {
             connectToWhatsApp();
           }, 3000);
         } 
-        // CASO 2: Disconnesso dal telefono (401, 403, 440)
         else if (statusCode === 401 || statusCode === 403 || statusCode === 440) {
           console.log('[WA] 📱 Disconnesso dal telefono, rigenerazione QR...');
           clearAuthFiles();
           sock = null;
           setTimeout(() => connectToWhatsApp(), 3000);
         }
-        // CASO 3: QR scaduto o sessione invalida (428, 500, 515)
         else if (statusCode === 428 || statusCode === 500 || statusCode === 515) {
           console.log('[WA] 🧹 Sessione invalida (code: ' + statusCode + '), pulizia e retry');
           clearAuthFiles();
           sock = null;
           setTimeout(() => connectToWhatsApp(), 3000);
         }
-        // CASO 4: Errore connessione generica (riprova senza pulire)
         else if (shouldReconnect && statusCode) {
           console.log('[WA] 🔄 Errore temporaneo (code: ' + statusCode + '), riconnessione tra 5 secondi...');
           setTimeout(() => connectToWhatsApp(), 5000);
         }
-        // CASO 5: Nessun codice specifico (pulisci preventivamente)
         else {
           console.log('[WA] ⚠️ Connessione chiusa senza codice valido, pulizia preventiva');
           clearAuthFiles();
@@ -208,14 +205,13 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiApp WhatsApp Server',
-    version: '1.4.0',
+    version: '1.5.0', // 🔥 Versione aggiornata
     connectionStatus: connectionStatus,
     connected: connectionStatus === 'connected',
     isConnecting: isConnecting
   });
 });
 
-// ✅ ROUTE /status CORRETTA
 app.get('/status', authenticate, (req, res) => {
   console.log('[STATUS] 📊 Richiesta stato ricevuta');
   console.log('[STATUS] connectionStatus:', connectionStatus);
