@@ -53,9 +53,12 @@ async function connectToWhatsApp() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      printQRInTerminal: true,
+      // printQRInTerminal rimosso (deprecato)
       logger,
-      browser: ['MiServe', 'Chrome', '120.0.0']
+      browser: ['MiServe', 'Chrome', '120.0.0'],
+      getMessage: async (key) => {
+        return { conversation: '' };
+      }
     });
     
     sock.ev.on('creds.update', saveCreds);
@@ -64,8 +67,10 @@ async function connectToWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
       
       if (qr) {
+        console.log('[WHATSAPP] 📱 QR Code generato');
         connectionStatus = 'qr_ready';
         qrCodeData = await QRCode.toDataURL(qr);
+        // Mostra QR in console solo per debug
         qrcode.generate(qr, { small: true });
       }
       
@@ -73,43 +78,50 @@ async function connectToWhatsApp() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
+        console.log('[WHATSAPP] ❌ Connessione chiusa');
         connectionStatus = 'disconnected';
         phoneNumber = null;
         qrCodeData = null;
         
         if (shouldReconnect) {
+          console.log('[WHATSAPP] 🔄 Riconnessione in corso...');
           setTimeout(() => connectToWhatsApp(), 3000);
+        } else {
+          console.log('[WHATSAPP] 🚫 Logout effettuato');
         }
       } 
       else if (connection === 'open') {
+        console.log('[WHATSAPP] ✅ Connesso con successo!');
         connectionStatus = 'connected';
         qrCodeData = null;
         
         const user = sock.user;
         phoneNumber = user?.id?.split(':')[0] || null;
+        console.log('[WHATSAPP] 📞 Numero:', phoneNumber);
       }
     });
     
   } catch (error) {
-    console.error('Errore connessione:', error);
+    console.error('[WHATSAPP] ❌ Errore connessione:', error);
     setTimeout(() => connectToWhatsApp(), 5000);
   }
 }
 
+// Avvia connessione WhatsApp
 connectToWhatsApp();
 
 // ROUTES
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'MiApp WhatsApp Server',
-    version: '1.0.0',
+    service: 'MiServe WhatsApp Server',
+    version: '1.0.1',
     connectionStatus: connectionStatus,
     connected: connectionStatus === 'connected'
   });
 });
 
-app.get('/status', authenticate, (req, res) => {
+app.get('/status', (req, res) => {
   res.json({
     success: true,
     status: connectionStatus,
@@ -125,30 +137,47 @@ app.post('/send', authenticate, async (req, res) => {
     const { phoneNumber: targetNumber, message } = req.body;
     
     if (!targetNumber || !message) {
-      return res.status(400).json({ error: 'phoneNumber e message richiesti' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'phoneNumber e message richiesti' 
+      });
     }
     
     if (!sock || connectionStatus !== 'connected') {
-      return res.status(503).json({ error: 'WhatsApp non connesso' });
+      return res.status(503).json({ 
+        success: false,
+        error: 'WhatsApp non connesso' 
+      });
     }
+    
+    console.log('[WHATSAPP] 📤 Invio messaggio a:', targetNumber);
     
     const cleanNumber = targetNumber.replace(/\D/g, '');
     const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
     
-    await sock.sendMessage(jid, { text: message });
+    const result = await sock.sendMessage(jid, { text: message });
+    
+    console.log('[WHATSAPP] ✅ Messaggio inviato');
     
     res.json({ 
       success: true,
-      messageId: Date.now().toString()
+      messageId: result.key.id || Date.now().toString()
     });
     
   } catch (error) {
-    res.status(500).json({ error: 'Errore invio messaggio' });
+    console.error('[WHATSAPP] ❌ Errore invio:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Errore invio messaggio',
+      details: error.message 
+    });
   }
 });
 
 app.post('/disconnect', authenticate, async (req, res) => {
   try {
+    console.log('[WHATSAPP] 🔌 Richiesta disconnessione');
+    
     if (sock) {
       await sock.logout();
       sock = null;
@@ -158,15 +187,25 @@ app.post('/disconnect', authenticate, async (req, res) => {
     phoneNumber = null;
     qrCodeData = null;
     
+    console.log('[WHATSAPP] ✅ Disconnesso');
+    
     res.json({ success: true });
     
-    setTimeout(() => connectToWhatsApp(), 2000);
+    setTimeout(() => {
+      console.log('[WHATSAPP] 🔄 Riavvio connessione...');
+      connectToWhatsApp();
+    }, 2000);
     
   } catch (error) {
-    res.status(500).json({ error: 'Errore disconnessione' });
+    console.error('[WHATSAPP] ❌ Errore disconnessione:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Errore disconnessione' 
+    });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server in ascolto su porta ${PORT}`);
+  console.log(`✅ Server WhatsApp in ascolto su porta ${PORT}`);
+  console.log(`🔐 Auth token configurato`);
 });

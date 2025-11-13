@@ -1,0 +1,14 @@
+[33m7267dd1[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m Fix WhatsApp connection: updated browser user-agent and timeouts
+[33m8095ecc[m Fix: Add connectionStatus and success flag in status endpoint
+[33mf99b3bc[m Fix: Auto-regenerate QR on phone disconnect
+[33m0ba6968[m Fix: WhatsApp connection with improved Baileys and pino logger
+[33m53d4ee5[m Remove package-lock.json
+[33md9cb106[m Update package-lock.json con qrcode
+[33m94c2699[m Add qrcode dependency
+[33m242c094[m Force redeploy - fix status endpoint
+[33m5e19e54[m Fix status endpoint pubblico
+[33mceb59db[m Convert to ES modules
+[33me651ade[m Fix nodejs package name
+[33m54ab7e0[m Fix Node version and package-lock
+[33m8053f1a[m Add railway config
+[33m67c9577[m Initial WhatsApp server setup
