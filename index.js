@@ -6,28 +6,32 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
-import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import fs from 'fs';
+import path from 'path';
 import pino from 'pino';
-import axios from 'axios';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'miserve_whatsapp_2024_SUPERSECRET123';
-const AUTH_DIR = './auth_info_baileys';
+const SESSIONS_DIR = './auth_sessions';
 
 app.use(cors());
 app.use(express.json());
 
-let sock = null;
-let qrCodeData = null;
-let connectionStatus = 'disconnected';
-let phoneNumber = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 3;
-
 const logger = pino({ level: 'silent' });
+
+// ========================================
+// 🆕 MULTI-TENANT: Gestione sessioni per utente
+// ========================================
+
+// Mappa delle sessioni attive: { odAd: { sock, status, qrCode, phoneNumber, reconnectAttempts } }
+const sessions = new Map();
+
+// Crea cartella sessioni se non esiste
+if (!fs.existsSync(SESSIONS_DIR)) {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+}
 
 // 🔐 MIDDLEWARE AUTENTICAZIONE
 function authenticate(req, res, next) {
@@ -46,38 +50,89 @@ function authenticate(req, res, next) {
   next();
 }
 
-// 🗑️ FUNZIONE: Elimina sessione corrotta
-async function clearAuthSession() {
+// 📁 Ottieni percorso auth per utente
+function getAuthDir(userId) {
+  return path.join(SESSIONS_DIR, userId);
+}
+
+// 🗑️ Elimina sessione utente
+async function clearUserSession(userId) {
   try {
-    if (fs.existsSync(AUTH_DIR)) {
-      console.log('[WHATSAPP] 🗑️ Pulizia sessione corrotta...');
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log('[WHATSAPP] ✅ Sessione eliminata');
+    const authDir = getAuthDir(userId);
+    if (fs.existsSync(authDir)) {
+      console.log(`[WA:${userId}] 🗑️ Pulizia sessione...`);
+      fs.rmSync(authDir, { recursive: true, force: true });
+      console.log(`[WA:${userId}] ✅ Sessione eliminata`);
     }
+    // Rimuovi dalla mappa
+    const session = sessions.get(userId);
+    if (session?.sock) {
+      try {
+        await session.sock.logout();
+      } catch (e) {
+        // Ignora errori logout
+      }
+    }
+    sessions.delete(userId);
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore pulizia sessione:', error);
+    console.error(`[WA:${userId}] ❌ Errore pulizia sessione:`, error);
   }
 }
 
-// 🔄 FUNZIONE: Connessione WhatsApp
-async function connectToWhatsApp(forceNewQR = false) {
+// 📊 Ottieni stato sessione utente
+function getSessionStatus(userId) {
+  const session = sessions.get(userId);
+  if (!session) {
+    return {
+      status: 'disconnected',
+      connected: false,
+      qrCode: null,
+      phoneNumber: null,
+      hasQR: false
+    };
+  }
+  return {
+    status: session.status,
+    connected: session.status === 'connected',
+    qrCode: session.qrCode,
+    phoneNumber: session.phoneNumber,
+    hasQR: session.qrCode !== null
+  };
+}
+
+// 🔄 Connetti WhatsApp per utente specifico
+async function connectUserWhatsApp(userId, forceNewQR = false) {
+  const MAX_RECONNECT_ATTEMPTS = 3;
+  
   try {
+    const authDir = getAuthDir(userId);
+    
     // Se forziamo nuovo QR, eliminiamo la sessione esistente
     if (forceNewQR) {
-      console.log('[WHATSAPP] 🔄 Rigenerazione QR forzata...');
-      await clearAuthSession();
-      connectionStatus = 'initializing';
-      qrCodeData = null;
-      phoneNumber = null;
-      reconnectAttempts = 0;
+      console.log(`[WA:${userId}] 🔄 Rigenerazione QR forzata...`);
+      await clearUserSession(userId);
     }
-
-    console.log('[WHATSAPP] 🚀 Avvio connessione...');
     
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    // Inizializza sessione in mappa
+    if (!sessions.has(userId)) {
+      sessions.set(userId, {
+        sock: null,
+        status: 'initializing',
+        qrCode: null,
+        phoneNumber: null,
+        reconnectAttempts: 0
+      });
+    }
+    
+    const session = sessions.get(userId);
+    session.status = 'initializing';
+    
+    console.log(`[WA:${userId}] 🚀 Avvio connessione...`);
+    
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    sock = makeWASocket({
+    const sock = makeWASocket({
       version,
       auth: {
         creds: state.creds,
@@ -90,6 +145,8 @@ async function connectToWhatsApp(forceNewQR = false) {
       }
     });
     
+    session.sock = sock;
+    
     sock.ev.on('creds.update', saveCreds);
     
     sock.ev.on('connection.update', async (update) => {
@@ -97,13 +154,10 @@ async function connectToWhatsApp(forceNewQR = false) {
       
       // 📱 GENERAZIONE QR CODE
       if (qr) {
-        console.log('[WHATSAPP] 📱 QR Code generato');
-        connectionStatus = 'qr_ready';
-        qrCodeData = await QRCode.toDataURL(qr);
-        reconnectAttempts = 0;
-        
-        // Mostra QR in console per debug
-        qrcode.generate(qr, { small: true });
+        console.log(`[WA:${userId}] 📱 QR Code generato`);
+        session.status = 'qr_ready';
+        session.qrCode = await QRCode.toDataURL(qr);
+        session.reconnectAttempts = 0;
       }
       
       // ❌ CONNESSIONE CHIUSA
@@ -111,77 +165,107 @@ async function connectToWhatsApp(forceNewQR = false) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log('[WHATSAPP] ❌ Connessione chiusa');
-        console.log('[WHATSAPP] 📊 Status Code:', statusCode);
-        console.log('[WHATSAPP] 📊 Disconnect Reason:', DisconnectReason[statusCode] || 'Unknown');
+        console.log(`[WA:${userId}] ❌ Connessione chiusa - Status: ${statusCode}`);
         
-        connectionStatus = 'disconnected';
-        phoneNumber = null;
+        session.status = 'disconnected';
+        session.phoneNumber = null;
         
         // 🔍 CASO 1: Logout esplicito
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log('[WHATSAPP] 🚫 Logout effettuato - Rigenerazione QR...');
-          await clearAuthSession();
-          qrCodeData = null;
-          setTimeout(() => connectToWhatsApp(true), 2000);
+          console.log(`[WA:${userId}] 🚫 Logout - Rigenerazione QR...`);
+          await clearUserSession(userId);
+          setTimeout(() => connectUserWhatsApp(userId, true), 2000);
         }
         // 🔍 CASO 2: Disconnessione dal telefono
         else if (statusCode === DisconnectReason.connectionClosed || 
                  statusCode === DisconnectReason.connectionLost ||
                  statusCode === DisconnectReason.timedOut) {
           
-          reconnectAttempts++;
-          console.log(`[WHATSAPP] 📱 Disconnessione rilevata (tentativo ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+          session.reconnectAttempts++;
+          console.log(`[WA:${userId}] 📱 Tentativo riconnessione ${session.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
           
-          if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            console.log('[WHATSAPP] 🔄 Troppi tentativi falliti - Rigenerazione QR...');
-            await clearAuthSession();
-            qrCodeData = null;
-            reconnectAttempts = 0;
-            setTimeout(() => connectToWhatsApp(true), 2000);
+          if (session.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            console.log(`[WA:${userId}] 🔄 Troppi tentativi - Rigenerazione QR...`);
+            await clearUserSession(userId);
+            setTimeout(() => connectUserWhatsApp(userId, true), 2000);
           } else {
-            console.log('[WHATSAPP] 🔄 Riconnessione automatica...');
-            qrCodeData = null;
-            setTimeout(() => connectToWhatsApp(), 3000);
+            session.qrCode = null;
+            setTimeout(() => connectUserWhatsApp(userId), 3000);
           }
         }
         // 🔍 CASO 3: Altri errori
         else if (shouldReconnect) {
-          console.log('[WHATSAPP] 🔄 Riconnessione generica...');
-          qrCodeData = null;
-          setTimeout(() => connectToWhatsApp(), 3000);
+          console.log(`[WA:${userId}] 🔄 Riconnessione generica...`);
+          session.qrCode = null;
+          setTimeout(() => connectUserWhatsApp(userId), 3000);
         }
       } 
       // ✅ CONNESSIONE APERTA
       else if (connection === 'open') {
-        console.log('[WHATSAPP] ✅ Connesso con successo!');
-        connectionStatus = 'connected';
-        qrCodeData = null;
-        reconnectAttempts = 0;
+        console.log(`[WA:${userId}] ✅ Connesso con successo!`);
+        session.status = 'connected';
+        session.qrCode = null;
+        session.reconnectAttempts = 0;
         
         const user = sock.user;
-        phoneNumber = user?.id?.split(':')[0] || null;
-        console.log('[WHATSAPP] 📞 Numero:', phoneNumber);
+        session.phoneNumber = user?.id?.split(':')[0] || null;
+        console.log(`[WA:${userId}] 📞 Numero: ${session.phoneNumber}`);
       }
       // 🔄 CONNESSIONE IN CORSO
       else if (connection === 'connecting') {
-        console.log('[WHATSAPP] 🔄 Connessione in corso...');
-        connectionStatus = 'connecting';
+        console.log(`[WA:${userId}] 🔄 Connessione in corso...`);
+        session.status = 'connecting';
       }
     });
     
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore connessione:', error);
-    connectionStatus = 'error';
-    setTimeout(() => connectToWhatsApp(), 5000);
+    console.error(`[WA:${userId}] ❌ Errore connessione:`, error);
+    const session = sessions.get(userId);
+    if (session) {
+      session.status = 'error';
+    }
+    setTimeout(() => connectUserWhatsApp(userId), 5000);
   }
 }
 
-// 🚀 AVVIO AUTOMATICO
-connectToWhatsApp();
+// 📤 Invia messaggio per utente specifico
+async function sendUserMessage(userId, phoneNumber, message) {
+  const session = sessions.get(userId);
+  
+  if (!session || !session.sock || session.status !== 'connected') {
+    throw new Error(`WhatsApp non connesso per utente ${userId}`);
+  }
+  
+  const cleanNumber = phoneNumber.replace(/\D/g, '');
+  const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
+  
+  const result = await session.sock.sendMessage(jid, { text: message });
+  
+  return result.key.id || Date.now().toString();
+}
+
+// 📤 Invia immagine per utente specifico
+async function sendUserImage(userId, phoneNumber, imageBuffer, mimeType, caption) {
+  const session = sessions.get(userId);
+  
+  if (!session || !session.sock || session.status !== 'connected') {
+    throw new Error(`WhatsApp non connesso per utente ${userId}`);
+  }
+  
+  const cleanNumber = phoneNumber.replace(/\D/g, '');
+  const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
+  
+  const result = await session.sock.sendMessage(jid, {
+    image: imageBuffer,
+    caption: caption || '',
+    mimetype: mimeType
+  });
+  
+  return result.key.id || Date.now().toString();
+}
 
 // ========================================
-// ROUTES API
+// ROUTES API - MULTI-TENANT
 // ========================================
 
 // 🏠 HOME - Info server
@@ -189,52 +273,93 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '2.1.0',  // 🆕 Versione aggiornata
-    connectionStatus: connectionStatus,
-    connected: connectionStatus === 'connected',
-    hasQR: qrCodeData !== null,
-    phoneNumber: phoneNumber,
+    version: '3.0.0-multitenant',
+    activeSessions: sessions.size,
     uptime: process.uptime(),
-    features: ['send', 'send-image', 'status', 'disconnect', 'regenerate-qr']  // 🆕
+    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr']
   });
 });
 
-// 📊 STATUS - Stato connessione + QR
-app.get('/status', (req, res) => {
+// 📊 STATUS - Stato connessione utente
+app.get('/status', authenticate, (req, res) => {
+  const userId = req.query.userId || req.headers['x-user-id'];
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto (query param o header x-user-id)' 
+    });
+  }
+  
+  const status = getSessionStatus(userId);
+  
   res.json({
     success: true,
-    status: connectionStatus,
-    connected: connectionStatus === 'connected',
-    qrCode: qrCodeData,
-    phoneNumber: phoneNumber,
-    hasQR: qrCodeData !== null,
-    reconnectAttempts: reconnectAttempts,
+    userId: userId,
+    ...status,
     timestamp: new Date().toISOString()
   });
 });
 
-// 🔄 REGENERATE QR - Forza nuovo QR code
-app.post('/regenerate-qr', authenticate, async (req, res) => {
+// 🔄 CONNECT - Avvia connessione per utente
+app.post('/connect', authenticate, async (req, res) => {
+  const { userId } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto' 
+    });
+  }
+  
   try {
-    console.log('[WHATSAPP] 🔄 Richiesta rigenerazione QR');
+    console.log(`[WA:${userId}] 🔌 Richiesta connessione`);
     
-    if (sock) {
-      try {
-        await sock.logout();
-      } catch (err) {
-        console.log('[WHATSAPP] ⚠️ Errore logout socket (ignorato):', err.message);
-      }
-      sock = null;
+    // Verifica se già connesso
+    const session = sessions.get(userId);
+    if (session?.status === 'connected') {
+      return res.json({
+        success: true,
+        message: 'Già connesso',
+        ...getSessionStatus(userId)
+      });
     }
     
-    await clearAuthSession();
+    // Avvia connessione
+    connectUserWhatsApp(userId, false);
     
-    connectionStatus = 'initializing';
-    phoneNumber = null;
-    qrCodeData = null;
-    reconnectAttempts = 0;
+    res.json({ 
+      success: true,
+      message: 'Connessione avviata...',
+      status: 'initializing'
+    });
     
-    setTimeout(() => connectToWhatsApp(true), 1000);
+  } catch (error) {
+    console.error(`[WA:${userId}] ❌ Errore connect:`, error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// 🔄 REGENERATE QR - Forza nuovo QR code per utente
+app.post('/regenerate-qr', authenticate, async (req, res) => {
+  const { userId } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto' 
+    });
+  }
+  
+  try {
+    console.log(`[WA:${userId}] 🔄 Richiesta rigenerazione QR`);
+    
+    await clearUserSession(userId);
+    
+    setTimeout(() => connectUserWhatsApp(userId, true), 1000);
     
     res.json({ 
       success: true,
@@ -243,102 +368,79 @@ app.post('/regenerate-qr', authenticate, async (req, res) => {
     });
     
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore rigenerazione QR:', error);
+    console.error(`[WA:${userId}] ❌ Errore rigenerazione QR:`, error);
     res.status(500).json({ 
       success: false,
-      error: 'Errore rigenerazione QR',
-      details: error.message
+      error: error.message
     });
   }
 });
 
 // 📤 SEND - Invio messaggio testuale
 app.post('/send', authenticate, async (req, res) => {
+  const { userId, phoneNumber, message } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto' 
+    });
+  }
+  
+  if (!phoneNumber || !message) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'phoneNumber e message richiesti' 
+    });
+  }
+  
   try {
-    const { phoneNumber: targetNumber, message } = req.body;
+    console.log(`[WA:${userId}] 📤 Invio messaggio a: ${phoneNumber}`);
     
-    if (!targetNumber || !message) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'phoneNumber e message richiesti' 
-      });
-    }
+    const messageId = await sendUserMessage(userId, phoneNumber, message);
     
-    if (!sock || connectionStatus !== 'connected') {
-      return res.status(503).json({ 
-        success: false,
-        error: 'WhatsApp non connesso',
-        status: connectionStatus
-      });
-    }
-    
-    console.log('[WHATSAPP] 📤 Invio messaggio a:', targetNumber);
-    
-    const cleanNumber = targetNumber.replace(/\D/g, '');
-    const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
-    
-    const result = await sock.sendMessage(jid, { text: message });
-    
-    console.log('[WHATSAPP] ✅ Messaggio inviato');
+    console.log(`[WA:${userId}] ✅ Messaggio inviato`);
     
     res.json({ 
       success: true,
-      messageId: result.key.id || Date.now().toString(),
+      messageId: messageId,
       timestamp: new Date().toISOString()
     });
     
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore invio:', error);
+    console.error(`[WA:${userId}] ❌ Errore invio:`, error);
     res.status(500).json({ 
       success: false,
-      error: 'Errore invio messaggio',
-      details: error.message 
+      error: error.message
     });
   }
 });
 
-// ========================================
-// 🆕 SEND-IMAGE - Invio messaggio con immagine
-// ========================================
+// 🖼️ SEND-IMAGE - Invio messaggio con immagine
 app.post('/send-image', authenticate, async (req, res) => {
+  const { userId, phoneNumber, imageUrl, caption } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto' 
+    });
+  }
+  
+  if (!phoneNumber || !imageUrl) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'phoneNumber e imageUrl richiesti' 
+    });
+  }
+  
   try {
-    const { phoneNumber: targetNumber, imageUrl, caption } = req.body;
-    
-    if (!targetNumber) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'phoneNumber è richiesto' 
-      });
-    }
-    
-    if (!imageUrl) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'imageUrl è richiesto' 
-      });
-    }
-    
-    if (!sock || connectionStatus !== 'connected') {
-      return res.status(503).json({ 
-        success: false,
-        error: 'WhatsApp non connesso',
-        status: connectionStatus
-      });
-    }
-    
-    console.log('[WHATSAPP] 🖼️ Invio immagine a:', targetNumber);
-    console.log('[WHATSAPP] 🔗 URL Immagine:', imageUrl.substring(0, 100) + '...');
-    
-    const cleanNumber = targetNumber.replace(/\D/g, '');
-    const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
+    console.log(`[WA:${userId}] 🖼️ Invio immagine a: ${phoneNumber}`);
     
     let imageBuffer;
     let mimeType = 'image/jpeg';
     
-    // 🔍 Controlla se è un URL o base64
     if (imageUrl.startsWith('data:')) {
-      // È un base64
-      console.log('[WHATSAPP] 📦 Immagine in formato base64');
       const matches = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
       if (!matches) {
         return res.status(400).json({ 
@@ -349,30 +451,15 @@ app.post('/send-image', authenticate, async (req, res) => {
       mimeType = matches[1];
       imageBuffer = Buffer.from(matches[2], 'base64');
     } else {
-      // È un URL - scarica l'immagine
-      console.log('[WHATSAPP] 🌐 Download immagine da URL...');
-      try {
-        const imageResponse = await axios.get(imageUrl, {
-          responseType: 'arraybuffer',
-          timeout: 30000,
-          headers: {
-            'User-Agent': 'MiServe WhatsApp Bot/2.1.0'
-          }
-        });
-        imageBuffer = Buffer.from(imageResponse.data);
-        mimeType = imageResponse.headers['content-type'] || 'image/jpeg';
-        console.log('[WHATSAPP] ✅ Immagine scaricata, dimensione:', imageBuffer.length, 'bytes');
-      } catch (downloadError) {
-        console.error('[WHATSAPP] ❌ Errore download immagine:', downloadError.message);
-        return res.status(400).json({ 
-          success: false,
-          error: 'Impossibile scaricare l\'immagine',
-          details: downloadError.message
-        });
-      }
+      const axios = (await import('axios')).default;
+      const imageResponse = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000
+      });
+      imageBuffer = Buffer.from(imageResponse.data);
+      mimeType = imageResponse.headers['content-type'] || 'image/jpeg';
     }
     
-    // Verifica dimensione (max 16MB per WhatsApp)
     if (imageBuffer.length > 16 * 1024 * 1024) {
       return res.status(400).json({ 
         success: false,
@@ -380,77 +467,115 @@ app.post('/send-image', authenticate, async (req, res) => {
       });
     }
     
-    // 📤 Invia messaggio con immagine
-    const result = await sock.sendMessage(jid, {
-      image: imageBuffer,
-      caption: caption || '',
-      mimetype: mimeType
-    });
+    const messageId = await sendUserImage(userId, phoneNumber, imageBuffer, mimeType, caption);
     
-    console.log('[WHATSAPP] ✅ Immagine inviata con successo');
+    console.log(`[WA:${userId}] ✅ Immagine inviata`);
     
     res.json({ 
       success: true,
-      messageId: result.key.id || Date.now().toString(),
+      messageId: messageId,
       timestamp: new Date().toISOString(),
       imageSize: imageBuffer.length
     });
     
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore invio immagine:', error);
+    console.error(`[WA:${userId}] ❌ Errore invio immagine:`, error);
     res.status(500).json({ 
       success: false,
-      error: 'Errore invio immagine',
-      details: error.message 
+      error: error.message
     });
   }
 });
 
-// 🔌 DISCONNECT - Disconnessione
+// 🔌 DISCONNECT - Disconnessione utente
 app.post('/disconnect', authenticate, async (req, res) => {
+  const { userId } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      success: false,
+      error: 'userId richiesto' 
+    });
+  }
+  
   try {
-    console.log('[WHATSAPP] 🔌 Richiesta disconnessione');
+    console.log(`[WA:${userId}] 🔌 Richiesta disconnessione`);
     
-    if (sock) {
-      await sock.logout();
-      sock = null;
-    }
+    await clearUserSession(userId);
     
-    await clearAuthSession();
-    
-    connectionStatus = 'disconnected';
-    phoneNumber = null;
-    qrCodeData = null;
-    reconnectAttempts = 0;
-    
-    console.log('[WHATSAPP] ✅ Disconnesso');
+    console.log(`[WA:${userId}] ✅ Disconnesso`);
     
     res.json({ 
       success: true,
-      message: 'Disconnesso - usa /regenerate-qr per riconnetterti'
+      message: 'Disconnesso'
     });
-    
-    // Avvia rigenerazione QR dopo 2 secondi
-    setTimeout(() => {
-      console.log('[WHATSAPP] 🔄 Auto-rigenerazione QR...');
-      connectToWhatsApp(true);
-    }, 2000);
     
   } catch (error) {
-    console.error('[WHATSAPP] ❌ Errore disconnessione:', error);
+    console.error(`[WA:${userId}] ❌ Errore disconnessione:`, error);
     res.status(500).json({ 
       success: false,
-      error: 'Errore disconnessione',
-      details: error.message
+      error: error.message
     });
   }
+});
+
+// 📊 ADMIN - Lista tutte le sessioni attive (solo admin)
+app.get('/admin/sessions', authenticate, (req, res) => {
+  const sessionList = [];
+  
+  sessions.forEach((session, odAd) => {
+    sessionList.push({
+      odAd,
+      status: session.status,
+      phoneNumber: session.phoneNumber,
+      hasQR: session.qrCode !== null
+    });
+  });
+  
+  res.json({
+    success: true,
+    totalSessions: sessions.size,
+    sessions: sessionList
+  });
 });
 
 // 🚀 AVVIO SERVER
 app.listen(PORT, () => {
-  console.log(`✅ Server WhatsApp in ascolto su porta ${PORT}`);
+  console.log('='.repeat(60));
+  console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
+  console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 2.1.0`);
-  console.log(`🖼️ Supporto immagini: ATTIVO`);
-  console.log(`🔄 Max tentativi riconnessione: ${MAX_RECONNECT_ATTEMPTS}`);
+  console.log(`📱 Versione: 3.0.0-multitenant`);
+  console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
+  console.log('='.repeat(60));
 });
+
+// 🔄 RESTORE SESSIONI ESISTENTI ALL'AVVIO
+async function restoreExistingSessions() {
+  try {
+    if (!fs.existsSync(SESSIONS_DIR)) return;
+    
+    const userDirs = fs.readdirSync(SESSIONS_DIR);
+    console.log(`[RESTORE] Trovate ${userDirs.length} sessioni da ripristinare...`);
+    
+    for (const odAd of userDirs) {
+      const authDir = path.join(SESSIONS_DIR, odAd);
+      const credsPath = path.join(authDir, 'creds.json');
+      
+      if (fs.existsSync(credsPath)) {
+        console.log(`[RESTORE] Ripristino sessione: ${odAd}`);
+        connectUserWhatsApp(odAd, false);
+        
+        // Attendi un po' tra le connessioni per non sovraccaricare
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+    
+    console.log('[RESTORE] ✅ Ripristino completato');
+  } catch (error) {
+    console.error('[RESTORE] ❌ Errore ripristino sessioni:', error);
+  }
+}
+
+// Avvia ripristino dopo 3 secondi dall'avvio
+setTimeout(restoreExistingSessions, 3000);
