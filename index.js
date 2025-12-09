@@ -152,7 +152,9 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       logger,
-      browser: ['MiServe', 'Chrome', '120.0.0'],
+      // 🔥 FIX ANDROID: Usa identificativo browser standard
+      browser: ['Ubuntu', 'Chrome', '120.0.6099.119'],
+      defaultQueryTimeoutMs: 60000,
       getMessage: async (key) => {
         return { conversation: '' };
       }
@@ -303,7 +305,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.3.0-original-with-lock',
+    version: '3.3.1-android-fix',
     activeSessions: sessions.size,
     uptime: process.uptime(),
     features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock']
@@ -614,7 +616,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.3.0-original-with-lock`);
+  console.log(`📱 Versione: 3.3.1-android-fix`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
