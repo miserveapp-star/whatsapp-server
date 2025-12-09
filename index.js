@@ -229,14 +229,7 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
             setTimeout(() => connectUserWhatsApp(userId), 3000);
           }
         }
-        // 🔍 CASO 3: Stream conflict (515) - altra sessione attiva
-        else if (statusCode === 515) {
-          console.log(`[WA:${userId}] ⚠️ Stream conflict - pulizia sessione`);
-          session.status = 'disconnected';
-          session.qrCode = null;
-          // NON riconnettiamo - l'utente deve cliccare di nuovo
-        }
-        // 🔍 CASO 4: Altri errori - riconnetti
+        // 🔍 CASO 3: Altri errori
         else if (shouldReconnect) {
           console.log(`[WA:${userId}] 🔄 Riconnessione generica...`);
           session.qrCode = null;
@@ -318,7 +311,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.3.3-no-auto-reconnect-515',
+    version: '3.3.2-ignore-late-qr',
     activeSessions: sessions.size,
     uptime: process.uptime(),
     features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock']
@@ -629,7 +622,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.3.3-no-auto-reconnect-515`);
+  console.log(`📱 Versione: 3.3.2-ignore-late-qr`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
