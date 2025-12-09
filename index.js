@@ -28,7 +28,7 @@ const logger = pino({ level: 'silent' });
 // Mappa delle sessioni attive: { odAd: { sock, status, qrCode, phoneNumber, reconnectAttempts } }
 const sessions = new Map();
 
-// 🔒 LOCK per evitare race condition - UNICA AGGIUNTA
+// 🔒 LOCK per evitare race condition
 const connectionLocks = new Map();
 
 // Crea cartella sessioni se non esiste
@@ -103,13 +103,20 @@ function getSessionStatus(userId) {
   };
 }
 
-// 🔄 Connetti WhatsApp per utente specifico (CODICE ORIGINALE + LOCK)
+// 🔄 Connetti WhatsApp per utente specifico (v3.4.0 - FIX LOOP 440)
 async function connectUserWhatsApp(userId, forceNewQR = false) {
   const MAX_RECONNECT_ATTEMPTS = 3;
   
   // 🔒 LOCK: Se già in corso per questo utente, esci
   if (connectionLocks.get(userId)) {
     console.log(`[WA:${userId}] ⏳ Connessione già in corso, skip`);
+    return;
+  }
+  
+  // 🔥 FIX v3.4.0: Se già connesso, NON fare nulla
+  const existingSession = sessions.get(userId);
+  if (existingSession?.status === 'connected' && existingSession?.sock && !forceNewQR) {
+    console.log(`[WA:${userId}] ✅ Già connesso, skip nuova connessione`);
     return;
   }
   
@@ -196,18 +203,32 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
         session.reconnectAttempts = 0;
       }
       
-      // ❌ CONNESSIONE CHIUSA (CODICE ORIGINALE)
+      // ❌ CONNESSIONE CHIUSA
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
         console.log(`[WA:${userId}] ❌ Connessione chiusa - Status: ${statusCode}`);
+        
+        // 🔥 FIX v3.4.0: Status 440 = Stream Conflict = C'è già una connessione attiva
+        // NON riconnettere, altrimenti crea loop infinito!
+        if (statusCode === 440) {
+          console.log(`[WA:${userId}] ⚠️ Stream conflict (440) - Connessione già attiva, IGNORO`);
+          // Non fare nulla - lascia che l'altra connessione funzioni
+          return;
+        }
+        
+        // 🔥 FIX v3.4.0: Se siamo ancora "connected" nel nostro stato, probabilmente
+        // è un evento spurio - ignoriamo
+        if (session.status === 'connected' && session.phoneNumber) {
+          console.log(`[WA:${userId}] ⚠️ Evento close ignorato - stato interno ancora connesso`);
+          return;
+        }
         
         session.status = 'disconnected';
         session.phoneNumber = null;
         
-        // 🔍 CASO 1: Logout esplicito
-        if (statusCode === DisconnectReason.loggedOut) {
+        // 🔍 CASO 1: Logout esplicito (401)
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
           console.log(`[WA:${userId}] 🚫 Logout - Rigenerazione QR...`);
           await clearUserSession(userId);
           setTimeout(() => connectUserWhatsApp(userId, true), 2000);
@@ -229,11 +250,24 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
             setTimeout(() => connectUserWhatsApp(userId), 3000);
           }
         }
-        // 🔍 CASO 3: Altri errori
-        else if (shouldReconnect) {
-          console.log(`[WA:${userId}] 🔄 Riconnessione generica...`);
+        // 🔍 CASO 3: Riavvio richiesto (515)
+        else if (statusCode === 515) {
+          console.log(`[WA:${userId}] 🔄 Riavvio richiesto (515) - Attendo 5 secondi...`);
           session.qrCode = null;
-          setTimeout(() => connectUserWhatsApp(userId), 3000);
+          setTimeout(() => connectUserWhatsApp(userId), 5000);
+        }
+        // 🔍 CASO 4: Altri errori - Riconnetti con cautela
+        else if (statusCode !== DisconnectReason.loggedOut) {
+          session.reconnectAttempts++;
+          
+          if (session.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            console.log(`[WA:${userId}] ❌ Troppi errori (${statusCode}) - Stop riconnessione`);
+            session.status = 'error';
+          } else {
+            console.log(`[WA:${userId}] 🔄 Riconnessione (${session.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+            session.qrCode = null;
+            setTimeout(() => connectUserWhatsApp(userId), 5000);
+          }
         }
       } 
       // ✅ CONNESSIONE APERTA
@@ -259,10 +293,17 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
     const session = sessions.get(userId);
     if (session) {
       session.status = 'error';
+      session.reconnectAttempts++;
     }
     // 🔓 Rilascia lock in caso di errore
     connectionLocks.delete(userId);
-    setTimeout(() => connectUserWhatsApp(userId), 5000);
+    
+    // 🔥 FIX: Non riconnettere all'infinito
+    if (session && session.reconnectAttempts < 3) {
+      setTimeout(() => connectUserWhatsApp(userId), 5000);
+    } else {
+      console.log(`[WA:${userId}] ❌ Troppi errori - Stop riconnessione automatica`);
+    }
   }
 }
 
@@ -311,10 +352,10 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.3.2-ignore-late-qr',
+    version: '3.4.0-fix-440-loop',
     activeSessions: sessions.size,
     uptime: process.uptime(),
-    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock']
+    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock', 'no-440-loop']
   });
 });
 
@@ -605,7 +646,8 @@ app.get('/admin/sessions', authenticate, (req, res) => {
       odAd,
       status: session.status,
       phoneNumber: session.phoneNumber,
-      hasQR: session.qrCode !== null
+      hasQR: session.qrCode !== null,
+      reconnectAttempts: session.reconnectAttempts
     });
   });
   
@@ -622,7 +664,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.3.2-ignore-late-qr`);
+  console.log(`📱 Versione: 3.4.0-fix-440-loop`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
