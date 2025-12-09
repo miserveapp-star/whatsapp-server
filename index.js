@@ -247,9 +247,10 @@ async function connectUserWhatsApp(userId, options = {}) {
         }
         // 🔍 CASO 2: Stream conflict (515) - qualcun altro si è connesso
         else if (statusCode === 515) {
-          console.log(`[WA:${userId}] ⚠️ Stream conflict - altra sessione attiva`);
-          currentSession.status = 'conflict';
-          // NON riconnettiamo - c'è un conflitto
+          console.log(`[WA:${userId}] ⚠️ Stream conflict - pulizia e attendo nuova richiesta`);
+          // Pulisci la sessione corrotta così l'utente può riprovare
+          await clearUserSession(userId, true);
+          // NON riconnettiamo automaticamente - l'utente deve disconnettere da WhatsApp e riprovare
         }
         // 🔍 CASO 3: Disconnessione temporanea - riprova
         else if (statusCode === DisconnectReason.connectionClosed || 
@@ -361,7 +362,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.2.0-multitenant-lockfix',
+    version: '3.2.1-multitenant-connectfix',
     activeSessions: sessions.size,
     activeConnections: [...sessions.values()].filter(s => s.status === 'connected').length,
     uptime: process.uptime(),
@@ -408,22 +409,48 @@ app.post('/connect', authenticate, async (req, res) => {
     return res.json({
       success: true,
       message: 'Connessione già in corso...',
-      status: 'processing'
+      status: 'processing',
+      ...getSessionStatus(userId)
     });
   }
   
   try {
-    console.log(`[WA:${userId}] 🔌 Richiesta connessione`);
-    
-    // Verifica se già connesso
+    // 🔥 FIX: Controlla TUTTI gli stati attivi, non solo 'connected'
     const session = sessions.get(userId);
-    if (session?.status === 'connected') {
-      return res.json({
-        success: true,
-        message: 'Già connesso',
-        ...getSessionStatus(userId)
-      });
+    
+    if (session) {
+      // Già connesso
+      if (session.status === 'connected') {
+        console.log(`[WA:${userId}] ✅ Già connesso, skip`);
+        return res.json({
+          success: true,
+          message: 'Già connesso',
+          ...getSessionStatus(userId)
+        });
+      }
+      
+      // QR già pronto - non avviare nuova connessione!
+      if (session.status === 'qr_ready' && session.qrCode) {
+        console.log(`[WA:${userId}] 📱 QR già pronto, skip`);
+        return res.json({
+          success: true,
+          message: 'QR Code già disponibile',
+          ...getSessionStatus(userId)
+        });
+      }
+      
+      // Connessione in corso
+      if (session.status === 'connecting' || session.status === 'initializing') {
+        console.log(`[WA:${userId}] 🔄 Connessione già in corso, skip`);
+        return res.json({
+          success: true,
+          message: 'Connessione in corso...',
+          ...getSessionStatus(userId)
+        });
+      }
     }
+    
+    console.log(`[WA:${userId}] 🔌 Richiesta connessione`);
     
     // Avvia connessione in background (non bloccante per la response)
     connectUserWhatsApp(userId, { forceNewQR: false });
@@ -668,7 +695,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.2.0-multitenant-lockfix`);
+  console.log(`📱 Versione: 3.2.1-multitenant-connectfix`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
