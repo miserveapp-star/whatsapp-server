@@ -156,7 +156,18 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
       if (qr) {
         console.log(`[WA:${userId}] 📱 QR Code generato`);
         session.status = 'qr_ready';
-        session.qrCode = await QRCode.toDataURL(qr);
+        
+        // 🔥 FIX: QR di alta qualità per Android
+        session.qrCode = await QRCode.toDataURL(qr, {
+          width: 400,                    // Dimensione maggiore (era default ~200)
+          margin: 2,                     // Margine bianco
+          errorCorrectionLevel: 'M',     // Correzione errori media (bilancia dimensione/affidabilità)
+          color: {
+            dark: '#000000',             // Nero puro
+            light: '#FFFFFF'             // Bianco puro
+          }
+        });
+        
         session.reconnectAttempts = 0;
       }
       
@@ -273,10 +284,10 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.0.0-multitenant',
+    version: '3.1.0-multitenant-qrfix',
     activeSessions: sessions.size,
     uptime: process.uptime(),
-    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr']
+    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes']
   });
 });
 
@@ -545,8 +556,9 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.0.0-multitenant`);
+  console.log(`📱 Versione: 3.1.0-multitenant-qrfix`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
+  console.log(`🔥 QR HD: 400px, correzione errori M`);
   console.log('='.repeat(60));
 });
 
