@@ -173,6 +173,12 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
       
       // 📱 GENERAZIONE QR CODE
       if (qr) {
+        // 🔥 FIX: Ignora QR se già connesso
+        if (session.status === 'connected') {
+          console.log(`[WA:${userId}] ⚠️ QR ignorato - già connesso`);
+          return;
+        }
+        
         console.log(`[WA:${userId}] 📱 QR Code generato`);
         session.status = 'qr_ready';
         
@@ -305,7 +311,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.3.1-android-fix',
+    version: '3.3.2-ignore-late-qr',
     activeSessions: sessions.size,
     uptime: process.uptime(),
     features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock']
@@ -616,7 +622,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.3.1-android-fix`);
+  console.log(`📱 Versione: 3.3.2-ignore-late-qr`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
