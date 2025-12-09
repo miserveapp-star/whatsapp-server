@@ -25,10 +25,10 @@ const logger = pino({ level: 'silent' });
 // 🆕 MULTI-TENANT: Gestione sessioni per utente
 // ========================================
 
-// Mappa delle sessioni attive
+// Mappa delle sessioni attive: { odAd: { sock, status, qrCode, phoneNumber, reconnectAttempts } }
 const sessions = new Map();
 
-// 🔒 LOCK per evitare race condition - NUOVA AGGIUNTA
+// 🔒 LOCK per evitare race condition - UNICA AGGIUNTA
 const connectionLocks = new Map();
 
 // Crea cartella sessioni se non esiste
@@ -58,60 +58,25 @@ function getAuthDir(userId) {
   return path.join(SESSIONS_DIR, userId);
 }
 
-// 🔒 Acquisisci lock per userId
-async function acquireLock(userId) {
-  // Se c'è già un lock attivo, aspetta che si liberi
-  while (connectionLocks.get(userId)) {
-    console.log(`[WA:${userId}] ⏳ In attesa del lock...`);
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  connectionLocks.set(userId, true);
-  console.log(`[WA:${userId}] 🔒 Lock acquisito`);
-}
-
-// 🔓 Rilascia lock per userId
-function releaseLock(userId) {
-  connectionLocks.delete(userId);
-  console.log(`[WA:${userId}] 🔓 Lock rilasciato`);
-}
-
-// 🗑️ Elimina sessione utente (SENZA riconnessione automatica)
-async function clearUserSession(userId, skipLogout = false) {
+// 🗑️ Elimina sessione utente (CODICE ORIGINALE)
+async function clearUserSession(userId) {
   try {
-    const session = sessions.get(userId);
-    
-    // Chiudi socket esistente in modo pulito
-    if (session?.sock) {
-      console.log(`[WA:${userId}] 🔌 Chiusura socket...`);
-      
-      // Rimuovi tutti i listener per evitare eventi a cascata
-      session.sock.ev.removeAllListeners('connection.update');
-      session.sock.ev.removeAllListeners('creds.update');
-      
-      try {
-        // Prima end(), poi logout() se necessario
-        session.sock.end(undefined);
-        
-        if (!skipLogout) {
-          await session.sock.logout().catch(() => {});
-        }
-      } catch (e) {
-        console.log(`[WA:${userId}] ⚠️ Errore chiusura socket (ignorato):`, e.message);
-      }
-    }
-    
-    // Rimuovi dalla mappa PRIMA di eliminare i file
-    sessions.delete(userId);
-    
-    // Elimina cartella auth
     const authDir = getAuthDir(userId);
     if (fs.existsSync(authDir)) {
-      console.log(`[WA:${userId}] 🗑️ Eliminazione file sessione...`);
+      console.log(`[WA:${userId}] 🗑️ Pulizia sessione...`);
       fs.rmSync(authDir, { recursive: true, force: true });
+      console.log(`[WA:${userId}] ✅ Sessione eliminata`);
     }
-    
-    console.log(`[WA:${userId}] ✅ Sessione pulita`);
-    
+    // Rimuovi dalla mappa
+    const session = sessions.get(userId);
+    if (session?.sock) {
+      try {
+        await session.sock.logout();
+      } catch (e) {
+        // Ignora errori logout
+      }
+    }
+    sessions.delete(userId);
   } catch (error) {
     console.error(`[WA:${userId}] ❌ Errore pulizia sessione:`, error);
   }
@@ -138,43 +103,42 @@ function getSessionStatus(userId) {
   };
 }
 
-// 🔄 Connetti WhatsApp per utente specifico
-async function connectUserWhatsApp(userId, options = {}) {
-  const { forceNewQR = false, isReconnect = false, skipLock = false } = options;
+// 🔄 Connetti WhatsApp per utente specifico (CODICE ORIGINALE + LOCK)
+async function connectUserWhatsApp(userId, forceNewQR = false) {
   const MAX_RECONNECT_ATTEMPTS = 3;
   
-  // 🔒 Acquisisci lock (a meno che non sia già dentro una riconnessione interna)
-  if (!skipLock) {
-    await acquireLock(userId);
+  // 🔒 LOCK: Se già in corso per questo utente, esci
+  if (connectionLocks.get(userId)) {
+    console.log(`[WA:${userId}] ⏳ Connessione già in corso, skip`);
+    return;
   }
+  
+  // 🔒 Imposta lock
+  connectionLocks.set(userId, true);
+  console.log(`[WA:${userId}] 🔒 Lock acquisito`);
   
   try {
     const authDir = getAuthDir(userId);
     
-    // Verifica se c'è già una connessione attiva
-    const existingSession = sessions.get(userId);
-    if (existingSession?.status === 'connected' && !forceNewQR) {
-      console.log(`[WA:${userId}] ✅ Già connesso, skip`);
-      return;
-    }
-    
     // Se forziamo nuovo QR, eliminiamo la sessione esistente
-    if (forceNewQR && existingSession) {
-      console.log(`[WA:${userId}] 🔄 Rigenerazione QR - pulizia sessione...`);
-      await clearUserSession(userId, true);
-      // Piccola pausa per assicurarsi che tutto sia pulito
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    if (forceNewQR) {
+      console.log(`[WA:${userId}] 🔄 Rigenerazione QR forzata...`);
+      await clearUserSession(userId);
     }
     
     // Inizializza sessione in mappa
-    const session = {
-      sock: null,
-      status: 'initializing',
-      qrCode: null,
-      phoneNumber: null,
-      reconnectAttempts: isReconnect ? (existingSession?.reconnectAttempts || 0) : 0
-    };
-    sessions.set(userId, session);
+    if (!sessions.has(userId)) {
+      sessions.set(userId, {
+        sock: null,
+        status: 'initializing',
+        qrCode: null,
+        phoneNumber: null,
+        reconnectAttempts: 0
+      });
+    }
+    
+    const session = sessions.get(userId);
+    session.status = 'initializing';
     
     console.log(`[WA:${userId}] 🚀 Avvio connessione...`);
     
@@ -191,33 +155,27 @@ async function connectUserWhatsApp(userId, options = {}) {
       browser: ['MiServe', 'Chrome', '120.0.0'],
       getMessage: async (key) => {
         return { conversation: '' };
-      },
-      // 🔥 Nuove opzioni per stabilità
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 30000,
-      retryRequestDelayMs: 500
+      }
     });
     
     session.sock = sock;
+    
+    // 🔓 Rilascia lock dopo che il socket è creato
+    connectionLocks.delete(userId);
+    console.log(`[WA:${userId}] 🔓 Lock rilasciato`);
     
     sock.ev.on('creds.update', saveCreds);
     
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
-      // Verifica che la sessione sia ancora valida (potrebbe essere stata eliminata)
-      const currentSession = sessions.get(userId);
-      if (!currentSession || currentSession.sock !== sock) {
-        console.log(`[WA:${userId}] ⚠️ Sessione non più valida, ignoro evento`);
-        return;
-      }
-      
       // 📱 GENERAZIONE QR CODE
       if (qr) {
         console.log(`[WA:${userId}] 📱 QR Code generato`);
-        currentSession.status = 'qr_ready';
+        session.status = 'qr_ready';
         
-        currentSession.qrCode = await QRCode.toDataURL(qr, {
+        // 🔥 FIX: QR di alta qualità per Android
+        session.qrCode = await QRCode.toDataURL(qr, {
           width: 400,
           margin: 2,
           errorCorrectionLevel: 'M',
@@ -227,79 +185,64 @@ async function connectUserWhatsApp(userId, options = {}) {
           }
         });
         
-        currentSession.reconnectAttempts = 0;
+        session.reconnectAttempts = 0;
       }
       
-      // ❌ CONNESSIONE CHIUSA
+      // ❌ CONNESSIONE CHIUSA (CODICE ORIGINALE)
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
         console.log(`[WA:${userId}] ❌ Connessione chiusa - Status: ${statusCode}`);
         
-        currentSession.status = 'disconnected';
-        currentSession.qrCode = null;
+        session.status = 'disconnected';
+        session.phoneNumber = null;
         
-        // 🔍 CASO 1: Logout esplicito (401)
+        // 🔍 CASO 1: Logout esplicito
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log(`[WA:${userId}] 🚫 Logout esplicito - attendo nuova richiesta utente`);
-          await clearUserSession(userId, true);
-          // NON riconnettiamo automaticamente - aspettiamo che l'utente clicchi "Connetti"
+          console.log(`[WA:${userId}] 🚫 Logout - Rigenerazione QR...`);
+          await clearUserSession(userId);
+          setTimeout(() => connectUserWhatsApp(userId, true), 2000);
         }
-        // 🔍 CASO 2: Stream conflict (515) - qualcun altro si è connesso
-        else if (statusCode === 515) {
-          console.log(`[WA:${userId}] ⚠️ Stream conflict - pulizia e attendo nuova richiesta`);
-          // Pulisci la sessione corrotta così l'utente può riprovare
-          await clearUserSession(userId, true);
-          // NON riconnettiamo automaticamente - l'utente deve disconnettere da WhatsApp e riprovare
-        }
-        // 🔍 CASO 3: Disconnessione temporanea - riprova
+        // 🔍 CASO 2: Disconnessione dal telefono
         else if (statusCode === DisconnectReason.connectionClosed || 
                  statusCode === DisconnectReason.connectionLost ||
-                 statusCode === DisconnectReason.timedOut ||
-                 statusCode === DisconnectReason.restartRequired) {
+                 statusCode === DisconnectReason.timedOut) {
           
-          currentSession.reconnectAttempts++;
-          console.log(`[WA:${userId}] 📱 Tentativo riconnessione ${currentSession.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+          session.reconnectAttempts++;
+          console.log(`[WA:${userId}] 📱 Tentativo riconnessione ${session.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
           
-          if (currentSession.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            console.log(`[WA:${userId}] ❌ Troppi tentativi falliti`);
-            currentSession.status = 'failed';
-            // Attendi nuova richiesta utente
+          if (session.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            console.log(`[WA:${userId}] 🔄 Troppi tentativi - Rigenerazione QR...`);
+            await clearUserSession(userId);
+            setTimeout(() => connectUserWhatsApp(userId, true), 2000);
           } else {
-            // Riconnetti dopo un delay
-            setTimeout(() => {
-              connectUserWhatsApp(userId, { isReconnect: true, skipLock: false });
-            }, 3000 * currentSession.reconnectAttempts); // Backoff incrementale
+            session.qrCode = null;
+            setTimeout(() => connectUserWhatsApp(userId), 3000);
           }
         }
-        // 🔍 CASO 4: Richiede riavvio
-        else if (statusCode === DisconnectReason.restartRequired) {
-          console.log(`[WA:${userId}] 🔄 Riavvio richiesto`);
-          setTimeout(() => {
-            connectUserWhatsApp(userId, { isReconnect: true, skipLock: false });
-          }, 2000);
-        }
-        // 🔍 CASO 5: Altri errori
-        else {
-          console.log(`[WA:${userId}] ⚠️ Errore sconosciuto: ${statusCode}`);
-          currentSession.status = 'error';
+        // 🔍 CASO 3: Altri errori
+        else if (shouldReconnect) {
+          console.log(`[WA:${userId}] 🔄 Riconnessione generica...`);
+          session.qrCode = null;
+          setTimeout(() => connectUserWhatsApp(userId), 3000);
         }
       } 
       // ✅ CONNESSIONE APERTA
       else if (connection === 'open') {
         console.log(`[WA:${userId}] ✅ Connesso con successo!`);
-        currentSession.status = 'connected';
-        currentSession.qrCode = null;
-        currentSession.reconnectAttempts = 0;
+        session.status = 'connected';
+        session.qrCode = null;
+        session.reconnectAttempts = 0;
         
         const user = sock.user;
-        currentSession.phoneNumber = user?.id?.split(':')[0] || null;
-        console.log(`[WA:${userId}] 📞 Numero: ${currentSession.phoneNumber}`);
+        session.phoneNumber = user?.id?.split(':')[0] || null;
+        console.log(`[WA:${userId}] 📞 Numero: ${session.phoneNumber}`);
       }
       // 🔄 CONNESSIONE IN CORSO
       else if (connection === 'connecting') {
         console.log(`[WA:${userId}] 🔄 Connessione in corso...`);
-        currentSession.status = 'connecting';
+        session.status = 'connecting';
       }
     });
     
@@ -309,11 +252,9 @@ async function connectUserWhatsApp(userId, options = {}) {
     if (session) {
       session.status = 'error';
     }
-  } finally {
-    // 🔓 Rilascia lock
-    if (!skipLock) {
-      releaseLock(userId);
-    }
+    // 🔓 Rilascia lock in caso di errore
+    connectionLocks.delete(userId);
+    setTimeout(() => connectUserWhatsApp(userId), 5000);
   }
 }
 
@@ -362,11 +303,10 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.2.1-multitenant-connectfix',
+    version: '3.3.0-original-with-lock',
     activeSessions: sessions.size,
-    activeConnections: [...sessions.values()].filter(s => s.status === 'connected').length,
     uptime: process.uptime(),
-    features: ['multi-tenant', 'connection-locks', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr']
+    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock']
   });
 });
 
@@ -382,18 +322,16 @@ app.get('/status', authenticate, (req, res) => {
   }
   
   const status = getSessionStatus(userId);
-  const isLocked = connectionLocks.has(userId);
   
   res.json({
     success: true,
     userId: userId,
     ...status,
-    isProcessing: isLocked,
     timestamp: new Date().toISOString()
   });
 });
 
-// 🔄 CONNECT - Avvia connessione per utente
+// 🔄 CONNECT - Avvia connessione per utente (+ CONTROLLO STATI)
 app.post('/connect', authenticate, async (req, res) => {
   const { userId } = req.body;
   
@@ -404,56 +342,51 @@ app.post('/connect', authenticate, async (req, res) => {
     });
   }
   
-  // 🔒 Verifica se c'è già un'operazione in corso
-  if (connectionLocks.has(userId)) {
-    return res.json({
-      success: true,
-      message: 'Connessione già in corso...',
-      status: 'processing',
-      ...getSessionStatus(userId)
-    });
-  }
-  
   try {
-    // 🔥 FIX: Controlla TUTTI gli stati attivi, non solo 'connected'
+    // 🔒 Verifica se c'è già un lock attivo
+    if (connectionLocks.get(userId)) {
+      console.log(`[WA:${userId}] ⏳ Lock attivo, ritorno stato attuale`);
+      return res.json({
+        success: true,
+        message: 'Connessione già in corso...',
+        ...getSessionStatus(userId)
+      });
+    }
+    
+    // Verifica stati esistenti
     const session = sessions.get(userId);
     
-    if (session) {
-      // Già connesso
-      if (session.status === 'connected') {
-        console.log(`[WA:${userId}] ✅ Già connesso, skip`);
-        return res.json({
-          success: true,
-          message: 'Già connesso',
-          ...getSessionStatus(userId)
-        });
-      }
-      
-      // QR già pronto - non avviare nuova connessione!
-      if (session.status === 'qr_ready' && session.qrCode) {
-        console.log(`[WA:${userId}] 📱 QR già pronto, skip`);
-        return res.json({
-          success: true,
-          message: 'QR Code già disponibile',
-          ...getSessionStatus(userId)
-        });
-      }
-      
-      // Connessione in corso
-      if (session.status === 'connecting' || session.status === 'initializing') {
-        console.log(`[WA:${userId}] 🔄 Connessione già in corso, skip`);
-        return res.json({
-          success: true,
-          message: 'Connessione in corso...',
-          ...getSessionStatus(userId)
-        });
-      }
+    if (session?.status === 'connected') {
+      console.log(`[WA:${userId}] ✅ Già connesso`);
+      return res.json({
+        success: true,
+        message: 'Già connesso',
+        ...getSessionStatus(userId)
+      });
+    }
+    
+    if (session?.status === 'qr_ready' && session.qrCode) {
+      console.log(`[WA:${userId}] 📱 QR già pronto`);
+      return res.json({
+        success: true,
+        message: 'QR Code già disponibile',
+        ...getSessionStatus(userId)
+      });
+    }
+    
+    if (session?.status === 'connecting' || session?.status === 'initializing') {
+      console.log(`[WA:${userId}] 🔄 Connessione già in corso`);
+      return res.json({
+        success: true,
+        message: 'Connessione in corso...',
+        ...getSessionStatus(userId)
+      });
     }
     
     console.log(`[WA:${userId}] 🔌 Richiesta connessione`);
     
-    // Avvia connessione in background (non bloccante per la response)
-    connectUserWhatsApp(userId, { forceNewQR: false });
+    // Avvia connessione
+    connectUserWhatsApp(userId, false);
     
     res.json({ 
       success: true,
@@ -481,20 +414,21 @@ app.post('/regenerate-qr', authenticate, async (req, res) => {
     });
   }
   
-  // 🔒 Verifica se c'è già un'operazione in corso
-  if (connectionLocks.has(userId)) {
+  // 🔒 Verifica lock
+  if (connectionLocks.get(userId)) {
     return res.json({
       success: false,
       message: 'Operazione già in corso, attendi...',
-      status: 'processing'
+      ...getSessionStatus(userId)
     });
   }
   
   try {
     console.log(`[WA:${userId}] 🔄 Richiesta rigenerazione QR`);
     
-    // Avvia rigenerazione in background
-    connectUserWhatsApp(userId, { forceNewQR: true });
+    await clearUserSession(userId);
+    
+    setTimeout(() => connectUserWhatsApp(userId, true), 1000);
     
     res.json({ 
       success: true,
@@ -633,21 +567,10 @@ app.post('/disconnect', authenticate, async (req, res) => {
     });
   }
   
-  // 🔒 Verifica se c'è già un'operazione in corso
-  if (connectionLocks.has(userId)) {
-    return res.json({
-      success: false,
-      message: 'Operazione in corso, attendi...',
-      status: 'processing'
-    });
-  }
-  
   try {
     console.log(`[WA:${userId}] 🔌 Richiesta disconnessione`);
     
-    await acquireLock(userId);
-    await clearUserSession(userId, false);
-    releaseLock(userId);
+    await clearUserSession(userId);
     
     console.log(`[WA:${userId}] ✅ Disconnesso`);
     
@@ -657,7 +580,6 @@ app.post('/disconnect', authenticate, async (req, res) => {
     });
     
   } catch (error) {
-    releaseLock(userId);
     console.error(`[WA:${userId}] ❌ Errore disconnessione:`, error);
     res.status(500).json({ 
       success: false,
@@ -675,16 +597,13 @@ app.get('/admin/sessions', authenticate, (req, res) => {
       odAd,
       status: session.status,
       phoneNumber: session.phoneNumber,
-      hasQR: session.qrCode !== null,
-      reconnectAttempts: session.reconnectAttempts
+      hasQR: session.qrCode !== null
     });
   });
   
   res.json({
     success: true,
     totalSessions: sessions.size,
-    connectedSessions: sessionList.filter(s => s.status === 'connected').length,
-    activeLocks: connectionLocks.size,
     sessions: sessionList
   });
 });
@@ -695,7 +614,7 @@ app.listen(PORT, () => {
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.2.1-multitenant-connectfix`);
+  console.log(`📱 Versione: 3.3.0-original-with-lock`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
   console.log('='.repeat(60));
@@ -715,10 +634,10 @@ async function restoreExistingSessions() {
       
       if (fs.existsSync(credsPath)) {
         console.log(`[RESTORE] Ripristino sessione: ${odAd}`);
-        await connectUserWhatsApp(odAd, { forceNewQR: false });
+        connectUserWhatsApp(odAd, false);
         
-        // Attendi tra le connessioni per non sovraccaricare
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Attendi un po' tra le connessioni per non sovraccaricare
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
     
@@ -728,20 +647,5 @@ async function restoreExistingSessions() {
   }
 }
 
-// Avvia ripristino dopo 5 secondi dall'avvio
-setTimeout(restoreExistingSessions, 5000);
-
-// 🧹 CLEANUP PERIODICO - Rimuovi sessioni morte
-setInterval(() => {
-  let cleaned = 0;
-  sessions.forEach((session, odAd) => {
-    if (session.status === 'error' || session.status === 'failed') {
-      // Sessioni in errore da più di 10 minuti - rimuovi
-      sessions.delete(odAd);
-      cleaned++;
-    }
-  });
-  if (cleaned > 0) {
-    console.log(`[CLEANUP] Rimosse ${cleaned} sessioni in errore`);
-  }
-}, 10 * 60 * 1000); // Ogni 10 minuti
+// Avvia ripristino dopo 3 secondi dall'avvio
+setTimeout(restoreExistingSessions, 3000);
