@@ -25,7 +25,7 @@ const logger = pino({ level: 'silent' });
 // 🆕 MULTI-TENANT: Gestione sessioni per utente
 // ========================================
 
-// Mappa delle sessioni attive: { odAd: { sock, status, qrCode, phoneNumber, reconnectAttempts } }
+// Mappa delle sessioni attive: { odAd: { sock, status, qrCode, phoneNumber, reconnectAttempts, keepAliveInterval } }
 const sessions = new Map();
 
 // 🔒 LOCK per evitare race condition
@@ -58,9 +58,17 @@ function getAuthDir(userId) {
   return path.join(SESSIONS_DIR, userId);
 }
 
-// 🗑️ Elimina sessione utente (CODICE ORIGINALE)
+// 🗑️ Elimina sessione utente
 async function clearUserSession(userId) {
   try {
+    const session = sessions.get(userId);
+    
+    // 🔥 v3.5.0: Pulisci keep-alive interval
+    if (session?.keepAliveInterval) {
+      clearInterval(session.keepAliveInterval);
+      console.log(`[WA:${userId}] 🧹 Keep-alive interval pulito`);
+    }
+    
     const authDir = getAuthDir(userId);
     if (fs.existsSync(authDir)) {
       console.log(`[WA:${userId}] 🗑️ Pulizia sessione...`);
@@ -68,7 +76,6 @@ async function clearUserSession(userId) {
       console.log(`[WA:${userId}] ✅ Sessione eliminata`);
     }
     // Rimuovi dalla mappa
-    const session = sessions.get(userId);
     if (session?.sock) {
       try {
         await session.sock.logout();
@@ -82,7 +89,7 @@ async function clearUserSession(userId) {
   }
 }
 
-// 📊 Ottieni stato sessione utente
+// 📊 Ottieni stato sessione utente (🔥 v3.5.0: CON VERIFICA REALE WebSocket)
 function getSessionStatus(userId) {
   const session = sessions.get(userId);
   if (!session) {
@@ -94,16 +101,92 @@ function getSessionStatus(userId) {
       hasQR: false
     };
   }
+  
+  // 🔥 v3.5.0: Verifica che il WebSocket sia realmente aperto
+  let realStatus = session.status;
+  let realConnected = session.status === 'connected';
+  
+  if (session.status === 'connected' && session.sock) {
+    const wsState = session.sock.ws?.readyState;
+    // WebSocket states: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+    if (wsState !== 1) {
+      console.log(`[WA:${userId}] ⚠️ getSessionStatus: stato interno 'connected' ma WebSocket.readyState=${wsState}`);
+      realStatus = 'disconnected';
+      realConnected = false;
+      
+      // Aggiorna anche lo stato interno per consistenza
+      session.status = 'disconnected';
+      session.phoneNumber = null;
+      
+      // Pulisci keep-alive se attivo
+      if (session.keepAliveInterval) {
+        clearInterval(session.keepAliveInterval);
+        session.keepAliveInterval = null;
+      }
+    }
+  }
+  
   return {
-    status: session.status,
-    connected: session.status === 'connected',
+    status: realStatus,
+    connected: realConnected,
     qrCode: session.qrCode,
     phoneNumber: session.phoneNumber,
     hasQR: session.qrCode !== null
   };
 }
 
-// 🔄 Connetti WhatsApp per utente specifico (v3.4.0 - FIX LOOP 440)
+// 🩺 v3.5.0: HEALTH CHECK - Verifica connessione reale periodicamente
+function startHealthCheck() {
+  const HEALTH_CHECK_INTERVAL = 60000; // 60 secondi
+  
+  setInterval(async () => {
+    const now = new Date().toISOString();
+    let checkedCount = 0;
+    let failedCount = 0;
+    
+    for (const [userId, session] of sessions.entries()) {
+      if (session.status === 'connected' && session.sock) {
+        checkedCount++;
+        try {
+          const wsState = session.sock.ws?.readyState;
+          
+          if (wsState !== 1) { // WebSocket.OPEN = 1
+            failedCount++;
+            console.log(`[WA:${userId}] 🩺 Health check FALLITO - WebSocket.readyState=${wsState}`);
+            
+            // Aggiorna stato
+            session.status = 'disconnected';
+            session.phoneNumber = null;
+            
+            // Pulisci keep-alive
+            if (session.keepAliveInterval) {
+              clearInterval(session.keepAliveInterval);
+              session.keepAliveInterval = null;
+            }
+            
+            // Tenta riconnessione automatica
+            console.log(`[WA:${userId}] 🔄 Avvio riconnessione automatica...`);
+            setTimeout(() => connectUserWhatsApp(userId, false), 2000);
+          }
+        } catch (error) {
+          failedCount++;
+          console.log(`[WA:${userId}] 🩺 Health check ERRORE:`, error.message);
+          session.status = 'disconnected';
+          session.phoneNumber = null;
+        }
+      }
+    }
+    
+    // Log solo se ci sono sessioni da controllare
+    if (checkedCount > 0) {
+      console.log(`[HEALTH] 🩺 ${now} - Controllate ${checkedCount} sessioni, ${failedCount} fallite`);
+    }
+  }, HEALTH_CHECK_INTERVAL);
+  
+  console.log(`[HEALTH] 🩺 Health check attivo (ogni ${HEALTH_CHECK_INTERVAL/1000}s)`);
+}
+
+// 🔄 Connetti WhatsApp per utente specifico (v3.5.0 - CON KEEP-ALIVE)
 async function connectUserWhatsApp(userId, forceNewQR = false) {
   const MAX_RECONNECT_ATTEMPTS = 3;
   
@@ -116,8 +199,14 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
   // 🔥 FIX v3.4.0: Se già connesso, NON fare nulla
   const existingSession = sessions.get(userId);
   if (existingSession?.status === 'connected' && existingSession?.sock && !forceNewQR) {
-    console.log(`[WA:${userId}] ✅ Già connesso, skip nuova connessione`);
-    return;
+    // 🔥 v3.5.0: Verifica anche WebSocket
+    const wsState = existingSession.sock.ws?.readyState;
+    if (wsState === 1) {
+      console.log(`[WA:${userId}] ✅ Già connesso (WebSocket OK), skip nuova connessione`);
+      return;
+    } else {
+      console.log(`[WA:${userId}] ⚠️ Stato 'connected' ma WebSocket=${wsState}, procedo con riconnessione`);
+    }
   }
   
   // 🔒 Imposta lock
@@ -140,7 +229,8 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
         status: 'initializing',
         qrCode: null,
         phoneNumber: null,
-        reconnectAttempts: 0
+        reconnectAttempts: 0,
+        keepAliveInterval: null // 🔥 v3.5.0
       });
     }
     
@@ -208,6 +298,13 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         
         console.log(`[WA:${userId}] ❌ Connessione chiusa - Status: ${statusCode}`);
+        
+        // 🔥 v3.5.0: Pulisci keep-alive quando la connessione si chiude
+        if (session.keepAliveInterval) {
+          clearInterval(session.keepAliveInterval);
+          session.keepAliveInterval = null;
+          console.log(`[WA:${userId}] 🧹 Keep-alive pulito (connessione chiusa)`);
+        }
         
         // 🔥 FIX v3.4.0: Status 440 = Stream Conflict = C'è già una connessione attiva
         // NON riconnettere, altrimenti crea loop infinito!
@@ -280,6 +377,45 @@ async function connectUserWhatsApp(userId, forceNewQR = false) {
         const user = sock.user;
         session.phoneNumber = user?.id?.split(':')[0] || null;
         console.log(`[WA:${userId}] 📞 Numero: ${session.phoneNumber}`);
+        
+        // 🔥 v3.5.0: Avvia Keep-alive con presence update ogni 5 minuti
+        if (session.keepAliveInterval) {
+          clearInterval(session.keepAliveInterval);
+        }
+        
+        const KEEP_ALIVE_INTERVAL = 300000; // 5 minuti
+        session.keepAliveInterval = setInterval(async () => {
+          try {
+            if (session.status === 'connected' && session.sock) {
+              // Verifica WebSocket prima di inviare
+              const wsState = session.sock.ws?.readyState;
+              if (wsState === 1) {
+                await session.sock.sendPresenceUpdate('available');
+                console.log(`[WA:${userId}] 💓 Keep-alive OK`);
+              } else {
+                throw new Error(`WebSocket non aperto (state=${wsState})`);
+              }
+            }
+          } catch (error) {
+            console.log(`[WA:${userId}] ⚠️ Keep-alive fallito:`, error.message);
+            
+            // La connessione è probabilmente morta, aggiorna stato
+            session.status = 'disconnected';
+            session.phoneNumber = null;
+            
+            // Pulisci interval
+            if (session.keepAliveInterval) {
+              clearInterval(session.keepAliveInterval);
+              session.keepAliveInterval = null;
+            }
+            
+            // Tenta riconnessione
+            console.log(`[WA:${userId}] 🔄 Avvio riconnessione da keep-alive...`);
+            setTimeout(() => connectUserWhatsApp(userId, false), 2000);
+          }
+        }, KEEP_ALIVE_INTERVAL);
+        
+        console.log(`[WA:${userId}] 💓 Keep-alive attivato (ogni ${KEEP_ALIVE_INTERVAL/1000/60} min)`);
       }
       // 🔄 CONNESSIONE IN CORSO
       else if (connection === 'connecting') {
@@ -315,6 +451,13 @@ async function sendUserMessage(userId, phoneNumber, message) {
     throw new Error(`WhatsApp non connesso per utente ${userId}`);
   }
   
+  // 🔥 v3.5.0: Verifica WebSocket prima di inviare
+  const wsState = session.sock.ws?.readyState;
+  if (wsState !== 1) {
+    session.status = 'disconnected';
+    throw new Error(`WebSocket non aperto (state=${wsState}) - riconnessione necessaria`);
+  }
+  
   const cleanNumber = phoneNumber.replace(/\D/g, '');
   const jid = cleanNumber.includes('@') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`;
   
@@ -329,6 +472,13 @@ async function sendUserImage(userId, phoneNumber, imageBuffer, mimeType, caption
   
   if (!session || !session.sock || session.status !== 'connected') {
     throw new Error(`WhatsApp non connesso per utente ${userId}`);
+  }
+  
+  // 🔥 v3.5.0: Verifica WebSocket prima di inviare
+  const wsState = session.sock.ws?.readyState;
+  if (wsState !== 1) {
+    session.status = 'disconnected';
+    throw new Error(`WebSocket non aperto (state=${wsState}) - riconnessione necessaria`);
   }
   
   const cleanNumber = phoneNumber.replace(/\D/g, '');
@@ -352,10 +502,23 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'MiServe WhatsApp Server',
-    version: '3.4.0-fix-440-loop',
+    version: '3.5.0-health-check',
     activeSessions: sessions.size,
     uptime: process.uptime(),
-    features: ['multi-tenant', 'send', 'send-image', 'status', 'disconnect', 'regenerate-qr', 'hd-qr-codes', 'connection-lock', 'no-440-loop']
+    features: [
+      'multi-tenant', 
+      'send', 
+      'send-image', 
+      'status', 
+      'disconnect', 
+      'regenerate-qr', 
+      'hd-qr-codes', 
+      'connection-lock', 
+      'no-440-loop',
+      'health-check',      // 🆕 v3.5.0
+      'keep-alive',        // 🆕 v3.5.0
+      'websocket-verify'   // 🆕 v3.5.0
+    ]
   });
 });
 
@@ -405,13 +568,20 @@ app.post('/connect', authenticate, async (req, res) => {
     // Verifica stati esistenti
     const session = sessions.get(userId);
     
+    // 🔥 v3.5.0: Verifica anche WebSocket per stato 'connected'
     if (session?.status === 'connected') {
-      console.log(`[WA:${userId}] ✅ Già connesso`);
-      return res.json({
-        success: true,
-        message: 'Già connesso',
-        ...getSessionStatus(userId)
-      });
+      const wsState = session.sock?.ws?.readyState;
+      if (wsState === 1) {
+        console.log(`[WA:${userId}] ✅ Già connesso (WebSocket OK)`);
+        return res.json({
+          success: true,
+          message: 'Già connesso',
+          ...getSessionStatus(userId)
+        });
+      } else {
+        console.log(`[WA:${userId}] ⚠️ Stato 'connected' ma WebSocket=${wsState}, riconnetto...`);
+        // Continua con la riconnessione
+      }
     }
     
     if (session?.status === 'qr_ready' && session.qrCode) {
@@ -642,12 +812,17 @@ app.get('/admin/sessions', authenticate, (req, res) => {
   const sessionList = [];
   
   sessions.forEach((session, odAd) => {
+    // 🔥 v3.5.0: Includi anche stato WebSocket
+    const wsState = session.sock?.ws?.readyState;
+    
     sessionList.push({
       odAd,
       status: session.status,
       phoneNumber: session.phoneNumber,
       hasQR: session.qrCode !== null,
-      reconnectAttempts: session.reconnectAttempts
+      reconnectAttempts: session.reconnectAttempts,
+      webSocketState: wsState, // 🆕 v3.5.0
+      keepAliveActive: session.keepAliveInterval !== null // 🆕 v3.5.0
     });
   });
   
@@ -658,16 +833,36 @@ app.get('/admin/sessions', authenticate, (req, res) => {
   });
 });
 
+// 🆕 v3.5.0: HEALTH - Endpoint per verificare salute del server
+app.get('/health', (req, res) => {
+  const healthySessions = Array.from(sessions.values()).filter(s => 
+    s.status === 'connected' && s.sock?.ws?.readyState === 1
+  ).length;
+  
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    totalSessions: sessions.size,
+    healthySessions: healthySessions,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // 🚀 AVVIO SERVER
 app.listen(PORT, () => {
   console.log('='.repeat(60));
   console.log(`✅ MiServe WhatsApp Server MULTI-TENANT`);
   console.log(`📡 Porta: ${PORT}`);
   console.log(`🔐 Auth token configurato`);
-  console.log(`📱 Versione: 3.4.0-fix-440-loop`);
+  console.log(`📱 Versione: 3.5.0-health-check`);
   console.log(`📂 Sessioni in: ${SESSIONS_DIR}`);
   console.log(`🔒 Sistema lock: ATTIVO`);
+  console.log(`🩺 Health check: ATTIVO`);
+  console.log(`💓 Keep-alive: ATTIVO`);
   console.log('='.repeat(60));
+  
+  // 🩺 v3.5.0: Avvia health check
+  startHealthCheck();
 });
 
 // 🔄 RESTORE SESSIONI ESISTENTI ALL'AVVIO
